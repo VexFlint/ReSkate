@@ -81,7 +81,8 @@ A source is an http(s) URL of an audio stream (an internet radio station, an
 MP3), or a file or folder in a Radio folder next to the server. Web pages and
 video sites are not sources. The server needs ffmpeg installed to decode it
 (on Windows, ffmpeg.exe on PATH); installing it takes effect on the next play,
-without a restart.
+without a restart. When a song cannot play, chat only says so; the server log
+also says why (the last lines ffmpeg printed).
 
 To play your own files, create a folder named Radio next to ReSkateServer.json
 (the server does not create it) and put audio files in it: .mp3, .ogg, .opus,

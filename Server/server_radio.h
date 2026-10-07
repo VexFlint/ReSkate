@@ -36,7 +36,10 @@ class Radio {
 
     struct Output {
         std::vector<multiplayer::RadioBatch> batches; // frames due now, in order
-        std::vector<std::string> notices;             // "Now playing ...", problems; for chat and the log
+        std::vector<std::string> notices;             // "Now playing ...", problems; for chat
+        // For the server log: every notice, and when a song fails, why (the last lines ffmpeg or
+        // yt-dlp wrote to stderr). Too long and too technical for chat.
+        std::vector<std::string> log;
     };
     // Frames due by `now_us`, up to a fifth of a second ahead. Never throws.
     Output poll(std::uint64_t now_us) noexcept;

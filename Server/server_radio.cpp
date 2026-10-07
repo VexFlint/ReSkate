@@ -6,8 +6,10 @@
 #include <condition_variable>
 #include <deque>
 #include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <opus.h>
+#include <optional>
 #include <thread>
 #ifdef _WIN32
 #include <Windows.h>
@@ -107,15 +109,53 @@ constexpr std::size_t batch_frames = 5;
 constexpr int bitrate = 96000;
 constexpr std::size_t max_listing = 1 << 20; // what yt-dlp may print about one source
 constexpr std::array<std::string_view, 9> audio_files{".mp3", ".ogg", ".opus", ".flac", ".wav", ".m4a", ".aac", ".webm", ".mka"};
+constexpr std::size_t said_lines = 4, said_line = 256; // what is kept of a tool's stderr: at most ~1 KB
+
+// The last lines a tool wrote to stderr, for the log when a song fails. Bounded however much the
+// tool says; control characters (and terminal colour codes) are dropped, a tab becomes a space.
+struct Said {
+    std::deque<std::string> lines;
+    std::string partial;
+    bool escape{};
+
+    void feed(const char *data, std::size_t size) {
+        for (const auto c : std::string_view(data, size)) {
+            const auto byte = static_cast<unsigned char>(c);
+            if (escape) { // ESC [ ... letter
+                escape = byte == 0x1B || !std::isalpha(byte);
+                continue;
+            }
+            if (byte == '\n' || byte == '\r') end_line();
+            else if (byte == 0x1B) escape = true;
+            else if (byte == '\t') add(' ');
+            else if (byte >= 32 && byte != 127) add(c);
+        }
+    }
+    void add(char c) {
+        if (partial.size() <= said_line) partial.push_back(c);
+    }
+    void end_line() {
+        cut_text(partial, said_line);
+        const auto line = trim(partial);
+        if (!line.empty()) {
+            lines.emplace_back(line);
+            if (lines.size() > said_lines) lines.pop_front();
+        }
+        partial.clear();
+    }
+};
 
 // The tools run from an argument list, never through a shell. A running one is a Child: stop and
 // skip end it together with anything it started (yt-dlp runs helpers of its own).
 #ifdef _WIN32
-// Its job object (which holds it and everything it starts), the process and the read end of its stdout.
+// Its job object (which holds it and everything it starts), the process and the read ends of its
+// stdout and stderr.
+using Pipe = HANDLE;
 struct Child {
-    HANDLE job{}, process{}, out{};
+    HANDLE job{}, process{}, out{}, err{};
     bool operator==(const Child &) const = default;
 };
+void close_pipe(Pipe pipe) { CloseHandle(pipe); }
 std::wstring widen(std::string_view text) {
     if (text.empty()) return {};
     const auto size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
@@ -160,23 +200,29 @@ std::wstring quote(const std::wstring &argument) {
     out.push_back(L'"');
     return out;
 }
-// stdout piped back, stdin and stderr on NUL, no console window, and nothing else of the server's
-// inherited: the handle list holds just those two.
+// stdout and stderr piped back, stdin on NUL, no console window, and nothing else of the server's
+// inherited: the handle list holds just those three.
 bool start(const std::vector<std::string> &args, Child &child) {
     const auto program = find_program(args.front());
     if (program.empty()) return false;
     std::wstring line = quote(program);
     for (std::size_t i = 1; i < args.size(); ++i) line += L' ' + quote(widen(args[i]));
     SECURITY_ATTRIBUTES inherit{sizeof inherit, nullptr, TRUE};
-    HANDLE read{}, write{};
+    HANDLE read{}, write{}, err_read{}, err_write{};
     if (!CreatePipe(&read, &write, &inherit, 0)) return false;
+    if (!CreatePipe(&err_read, &err_write, &inherit, 0)) {
+        CloseHandle(read);
+        CloseHandle(write);
+        return false;
+    }
     SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(err_read, HANDLE_FLAG_INHERIT, 0);
     const HANDLE null = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit,
                                     OPEN_EXISTING, 0, nullptr);
     const HANDLE job = CreateJobObjectW(nullptr, nullptr);
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    std::array<HANDLE, 2> handles{write, null};
+    std::array<HANDLE, 3> handles{write, err_write, null};
     SIZE_T size{};
     InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
     std::vector<std::byte> storage(size);
@@ -192,7 +238,7 @@ bool start(const std::vector<std::string> &args, Child &child) {
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     startup.StartupInfo.hStdInput = null;
     startup.StartupInfo.hStdOutput = write;
-    startup.StartupInfo.hStdError = null;
+    startup.StartupInfo.hStdError = err_write;
     startup.lpAttributeList = attributes;
     PROCESS_INFORMATION info{};
     // Suspended until it is in the job, so nothing it starts can escape the job.
@@ -201,6 +247,7 @@ bool start(const std::vector<std::string> &args, Child &child) {
                               &startup.StartupInfo, &info);
     if (listed) DeleteProcThreadAttributeList(attributes);
     CloseHandle(write);
+    CloseHandle(err_write);
     if (null != INVALID_HANDLE_VALUE) CloseHandle(null);
     if (ok && !AssignProcessToJobObject(job, info.hProcess)) {
         TerminateProcess(info.hProcess, 1);
@@ -214,15 +261,16 @@ bool start(const std::vector<std::string> &args, Child &child) {
         if (info.hProcess) CloseHandle(info.hProcess);
         if (job) CloseHandle(job);
         CloseHandle(read);
+        CloseHandle(err_read);
         return false;
     }
-    child = {job, info.hProcess, read};
+    child = {job, info.hProcess, read, err_read};
     return true;
 }
-// Bytes read, or 0 once the tool has closed its output (or ended).
-std::size_t read_some(const Child &child, char *buffer, std::size_t size) {
+// Bytes read, or 0 once the tool has closed that output (or ended).
+std::size_t read_some(Pipe pipe, char *buffer, std::size_t size) {
     DWORD count{};
-    return ReadFile(child.out, buffer, static_cast<DWORD>(size), &count, nullptr) ? count : 0;
+    return ReadFile(pipe, buffer, static_cast<DWORD>(size), &count, nullptr) ? count : 0;
 }
 void terminate(const Child &child) {
     if (child.job) TerminateJobObject(child.job, 1);
@@ -238,12 +286,14 @@ int wait_for(const Child &child) {
 }
 void release(const Child &child) { CloseHandle(child.job); } // ends whatever the tool left running
 #else
-// Its process group (the tool leads it) and the read end of its stdout.
+// Its process group (the tool leads it) and the read ends of its stdout and stderr.
+using Pipe = int;
 struct Child {
     pid_t pid{};
-    int out = -1;
+    int out = -1, err = -1;
     bool operator==(const Child &) const = default;
 };
+void close_pipe(Pipe pipe) { close(pipe); }
 bool installed(const char *program) {
     const char *path = std::getenv("PATH");
     for (std::string_view rest = path ? path : ""; !rest.empty();) {
@@ -254,15 +304,20 @@ bool installed(const char *program) {
     }
     return false;
 }
-// Its own process group, stdin and stderr closed off, stdout piped back.
+// Its own process group, stdin closed off, stdout and stderr piped back.
 bool start(const std::vector<std::string> &args, Child &child) {
-    int fds[2];
+    int fds[2], errs[2];
     if (pipe2(fds, O_CLOEXEC) != 0) return false;
+    if (pipe2(errs, O_CLOEXEC) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return false;
+    }
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, errs[1], STDERR_FILENO);
     posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     posix_spawnattr_t attributes;
     posix_spawnattr_init(&attributes);
     // The server ignores SIGPIPE; a tool must not inherit that, or it would outlive a closed pipe.
@@ -282,16 +337,18 @@ bool start(const std::vector<std::string> &args, Child &child) {
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attributes);
     close(fds[1]);
+    close(errs[1]);
     if (result != 0) {
         close(fds[0]);
+        close(errs[0]);
         return false;
     }
-    child = {pid, fds[0]};
+    child = {pid, fds[0], errs[0]};
     return true;
 }
-std::size_t read_some(const Child &child, char *buffer, std::size_t size) {
+std::size_t read_some(Pipe pipe, char *buffer, std::size_t size) {
     for (;;) {
-        const auto count = read(child.out, buffer, size);
+        const auto count = read(pipe, buffer, size);
         if (count >= 0) return static_cast<std::size_t>(count);
         if (errno != EINTR) return 0;
     }
@@ -339,7 +396,7 @@ struct Radio::State {
     mutable std::mutex mutex;
     std::condition_variable room; // the worker waits here for space in the queue
     std::deque<Item> queue;
-    std::deque<std::string> notices;
+    std::deque<std::string> notices, log; // for chat; for the server log
     std::thread worker;
     bool cancel{}, worker_done{}, active{};
     Child child; // the running tool
@@ -347,9 +404,47 @@ struct Radio::State {
     std::string source, playing_title;
     std::uint64_t next_at{}, frames{}, bytes{}, started{};
 
+    // A running tool. `reader` drains its stderr into `said` on a thread of its own, so a tool that
+    // says a lot never blocks on a full stderr pipe while the worker reads (or waits to queue) its
+    // stdout. `said` is shared with the reader and read once reap() has joined it.
+    struct Tool {
+        std::string name;
+        Child child;
+        std::shared_ptr<Said> said = std::make_shared<Said>();
+        std::thread reader;
+        Tool() = default;
+        Tool(const Tool &) = delete;
+        Tool &operator=(const Tool &) = delete;
+        ~Tool() {
+            if (reader.joinable()) reader.detach(); // only if reap() never ran (an exception)
+        }
+    };
+    // The worker's last tool: how it ended and its last stderr lines, for the log when a song fails.
+    struct Report {
+        std::string tool;
+        std::optional<int> code; // none: it did not start
+        std::deque<std::string> said;
+    } last;
+
     void notice(std::string text) {
         std::lock_guard lock(mutex);
+        log.push_back(text);
         notices.push_back(std::move(text));
+    }
+    // `chat` for chat; for the log, `headline` with why (from the last tool): its last stderr line,
+    // then every line kept if there are more.
+    void failed(std::string chat, const std::string &headline) {
+        if (last.tool.empty()) return notice(std::move(chat));
+        const auto reason = !last.said.empty() ? last.said.back()
+                            : !last.code       ? last.tool + " did not start"
+                            : *last.code < 0   ? last.tool + " was killed"
+                            : *last.code       ? last.tool + " ended with code " + std::to_string(*last.code)
+                                               : last.tool + " gave nothing to play";
+        std::lock_guard lock(mutex);
+        notices.push_back(std::move(chat));
+        log.push_back(headline + ": " + reason);
+        if (last.said.size() > 1)
+            for (const auto &line : last.said) log.push_back("  " + last.tool + ": " + line);
     }
     bool cancelled() {
         std::lock_guard lock(mutex);
@@ -371,28 +466,44 @@ struct Radio::State {
         playing_title.clear();
     }
 
-    bool spawn(const std::vector<std::string> &args, Child &started_child) {
-        if (!start(args, started_child)) return false;
-        std::lock_guard lock(mutex);
-        child = started_child;
-        if (cancel) terminate(started_child); // stopped while it started
-        return true;
-    }
-    int reap(const Child &done) {
-        const auto code = wait_for(done);
+    bool spawn(const std::vector<std::string> &args, Tool &tool) {
+        tool.name = args.front();
+        last = {tool.name, {}, {}};
+        if (!start(args, tool.child)) return false;
         {
             std::lock_guard lock(mutex);
-            if (child == done) child = {};
+            child = tool.child;
+            if (cancel) terminate(tool.child); // stopped while it started
         }
-        release(done);
+        try {
+            tool.reader = std::thread([pipe = tool.child.err, said = tool.said] {
+                char buffer[1024];
+                for (std::size_t count; (count = read_some(pipe, buffer, sizeof buffer)) != 0;) said->feed(buffer, count);
+                said->end_line();
+                close_pipe(pipe);
+            });
+        } catch (...) {
+            close_pipe(tool.child.err); // no reader: the tool's stderr writes fail instead of blocking
+        }
+        return true;
+    }
+    int reap(Tool &tool) {
+        const auto code = wait_for(tool.child);
+        {
+            std::lock_guard lock(mutex);
+            if (child == tool.child) child = {};
+        }
+        release(tool.child); // on Windows this ends whatever the tool left holding its stderr
+        if (tool.reader.joinable()) tool.reader.join();
+        last = {tool.name, code, std::move(tool.said->lines)};
         return code;
     }
     std::string capture(const std::vector<std::string> &args) {
-        Child tool;
+        Tool tool;
         if (!spawn(args, tool)) return {};
         std::string text;
         char buffer[4096];
-        for (std::size_t count; (count = read_some(tool, buffer, sizeof buffer)) != 0;)
+        for (std::size_t count; (count = read_some(tool.child.out, buffer, sizeof buffer)) != 0;)
             if (text.size() < max_listing) text.append(buffer, count);
         return reap(tool) == 0 ? text : std::string{};
     }
@@ -476,7 +587,7 @@ struct Radio::State {
         args.insert(args.end(), {"-protocol_whitelist", remote ? "http,https,tcp,tls,crypto,hls" : "file", "-i",
                                  remote ? input : "file:" + input, "-vn", "-ac", "2", "-ar", std::to_string(radio_rate),
                                  "-f", "s16le", "pipe:1"});
-        Child tool;
+        Tool tool;
         const bool running = spawn(args, tool);
         std::size_t queued{};
         if (running) {
@@ -497,7 +608,7 @@ struct Radio::State {
                 return true;
             };
             char buffer[16384];
-            for (std::size_t count; open && (count = read_some(tool, buffer, sizeof buffer)) != 0;) {
+            for (std::size_t count; open && (count = read_some(tool.child.out, buffer, sizeof buffer)) != 0;) {
                 raw.insert(raw.end(), buffer, buffer + count);
                 const auto whole = raw.size() / 2;
                 for (std::size_t i = 0; i < whole; ++i)
@@ -509,7 +620,7 @@ struct Radio::State {
                 pcm.resize(samples);
                 encode();
             }
-            if (!open) terminate(tool); // skipped or stopped: ffmpeg may still be writing
+            if (!open) terminate(tool.child); // skipped or stopped: ffmpeg may still be writing
             reap(tool);
         }
         opus_encoder_destroy(encoder);
@@ -518,15 +629,19 @@ struct Radio::State {
 
     void run(std::string input) {
         const bool remote = web_url(input);
+        last = {};
         const auto list = entries(input);
         if (list.empty())
-            notice("Radio: nothing to play at " + input + (remote && !ytdlp ? " (pages and playlists need yt-dlp installed)" : "") + ".");
+            failed("Radio: nothing to play at " + input + (remote && !ytdlp ? " (pages and playlists need yt-dlp installed)" : "") + ".",
+                   "Radio: nothing to play at " + input);
         for (const auto &entry : list) {
             if (cancelled()) return;
+            last = {};
             // A skip only ends a song that has already queued frames, so no frames at all is a failure.
             if (!play(entry, remote) && !cancelled())
-                notice("Radio: could not play " + entry.title +
-                       (remote && !ytdlp ? " (a page like YouTube needs yt-dlp on the server)." : "."));
+                failed("Radio: could not play " + entry.title +
+                           (remote && !ytdlp ? " (a page like YouTube needs yt-dlp on the server)." : "."),
+                       "Radio: could not play " + entry.title);
         }
         std::lock_guard lock(mutex);
         worker_done = true;
@@ -608,10 +723,14 @@ Radio::Output Radio::poll(std::uint64_t now) noexcept {
     auto &s = *state_;
     try {
         std::lock_guard lock(s.mutex);
-        while (!s.notices.empty()) {
-            out.notices.push_back(std::move(s.notices.front()));
-            s.notices.pop_front();
-        }
+        out.notices.assign(std::make_move_iterator(s.notices.begin()), std::make_move_iterator(s.notices.end()));
+        out.log.assign(std::make_move_iterator(s.log.begin()), std::make_move_iterator(s.log.end()));
+        s.notices.clear();
+        s.log.clear();
+        const auto notice = [&](const std::string &text) {
+            out.notices.push_back(text);
+            out.log.push_back(text);
+        };
         if (!s.active) return out;
         // Real time: frames leave one per 20 ms, a little ahead. After a stall (a slow source,
         // the server held up) the clock starts again from now rather than bursting to catch up.
@@ -622,7 +741,7 @@ Radio::Output Radio::poll(std::uint64_t now) noexcept {
             if (item.track <= s.skipped) continue;
             if (!item.title.empty()) {
                 s.playing_title = item.title;
-                out.notices.push_back("Now playing: " + item.title);
+                notice("Now playing: " + item.title);
             }
             s.playing_track = item.track;
             if (out.batches.empty() || out.batches.back().track != item.track ||
@@ -638,7 +757,7 @@ Radio::Output Radio::poll(std::uint64_t now) noexcept {
         if (s.worker_done && s.queue.empty() && s.next_at <= now) {
             s.active = false;
             s.playing_title.clear();
-            out.notices.push_back("Radio: the queue has finished.");
+            notice("Radio: the queue has finished.");
         }
     } catch (...) {
     }

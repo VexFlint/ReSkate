@@ -33,7 +33,9 @@ MP3), or a file or folder in a Radio folder next to the server. The server
 needs ffmpeg installed to decode it. With yt-dlp installed too, a URL can also
 be a page or playlist yt-dlp reads, such as a YouTube video or channel. On
 Windows both must be on PATH as ffmpeg.exe and yt-dlp.exe. Installing either
-takes effect on the next play, without a restart.
+takes effect on the next play, without a restart. When a song cannot play,
+chat only says so; the server log also says why (the last lines ffmpeg or
+yt-dlp printed).
 
 The server sends the audio to every player itself, so you are the one
 redistributing it. Only play what you may share with them: your own files,

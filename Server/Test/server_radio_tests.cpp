@@ -1,5 +1,6 @@
 #include "Server/server_radio.h"
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -80,7 +81,7 @@ double tone_share(const std::vector<float> &left, double frequency) {
 }
 struct Played {
     std::map<std::uint32_t, std::vector<float>> left; // decoded, per track
-    std::vector<std::string> notices;
+    std::vector<std::string> notices, log;
     std::size_t frames{};
     bool paced = true;
 };
@@ -94,6 +95,7 @@ Played listen(Radio &radio, unsigned steps, const std::string &skip_after = {}) 
     for (unsigned step = 0; step < steps; ++step, now += 20000) {
         auto out = radio.poll(now);
         for (auto &notice : out.notices) played.notices.push_back(notice);
+        for (auto &line : out.log) played.log.push_back(line);
         for (const auto &batch : out.batches)
             for (const auto &frame : batch.frames) {
                 auto &decoder = decoders[batch.track];
@@ -167,6 +169,28 @@ void tones(const fs::path &root) {
         check(tone_share(b, 880) > 0.9, "the second song is not at 880 Hz");
     }
     {
+        // A file ffmpeg cannot decode: chat gets the short notice, the log why (ffmpeg's last
+        // stderr line).
+        { std::ofstream(folder / "broken.mp3") << "this is not audio\n"; }
+        Radio radio(folder);
+        radio.play("broken.mp3");
+        const auto played = listen(radio, 500);
+        check(played.frames == 0, "a broken file played");
+        check(std::ranges::find(played.notices, "Radio: could not play broken.") != played.notices.end(),
+              "no could-not-play notice in chat");
+        check(std::ranges::none_of(played.notices, [](const std::string &n) { return n.starts_with("Radio: could not play broken:"); }),
+              "the reason went to chat");
+        const auto reason = std::ranges::find_if(played.log, [](const std::string &l) { return l.starts_with("Radio: could not play broken: "); });
+        check(reason != played.log.end() && reason->size() > std::string_view("Radio: could not play broken: ").size(),
+              "no reason in the log");
+        check(reason->size() < 400, "the reason is not short: " + *reason);
+        for (const auto &line : played.log)
+            check(std::ranges::none_of(line, [](unsigned char c) { return c < 32 || c == 127; }), "control character in the log: " + line);
+        check(played.log.back() == "Radio: the queue has finished.", "the radio did not finish after a broken file");
+        std::cout << "broken file, as the log has it:\n";
+        for (const auto &line : played.log) std::cout << "  " << line << '\n';
+    }
+    {
         Radio radio(folder);
         radio.play("set");
         listen(radio, 30);
@@ -175,6 +199,47 @@ void tones(const fs::path &root) {
         check(radio.poll(2000000000).batches.empty(), "frames after stop");
     }
 }
+#ifndef _WIN32
+// A stand-in ffmpeg that says far more on stderr than a pipe holds (colour codes, tabs, bells and
+// one very long line among it), then fails. The radio must keep reading it, so the tool never
+// blocks, and keep only a few short, clean lines of it.
+void chatty_tool(const fs::path &root) {
+    const auto bin = root / "bin";
+    fs::create_directories(bin);
+    {
+        std::ofstream script(bin / "ffmpeg");
+        script << "#!/bin/sh\n"
+                  "i=0\n"
+                  "while [ $i -lt 5000 ]; do printf 'noise %d \\033[31mred\\033[0m\\tbell\\a\\n' $i >&2; i=$((i+1)); done\n"
+                  "head -c 10000 /dev/zero | tr '\\0' x >&2\n"
+                  "printf '\\nlast\\twords\\r\\n' >&2\n"
+                  "exit 1\n";
+    }
+    fs::permissions(bin / "ffmpeg", fs::perms::owner_all);
+    const std::string path = std::getenv("PATH") ? std::getenv("PATH") : "";
+    setenv("PATH", (bin.string() + ":" + path).c_str(), 1);
+    Played played;
+    {
+        Radio radio(root / "Radio");
+        check(radio.play("tone.wav").starts_with("Radio: starting"), "play refused a file");
+        played = listen(radio, 1000);
+    }
+    setenv("PATH", path.c_str(), 1);
+    fs::remove_all(bin);
+    check(std::ranges::find(played.notices, "Radio: could not play tone.") != played.notices.end(),
+          "no could-not-play notice for the chatty tool (did it block on stderr?)");
+    check(std::ranges::find(played.log, "Radio: could not play tone: last words") != played.log.end(),
+          "the reason is not the tool's last line, cleaned");
+    std::size_t kept{};
+    for (const auto &line : played.log) {
+        check(line.size() <= 300, "a long line was kept whole");
+        check(std::ranges::none_of(line, [](unsigned char c) { return c < 32 || c == 127; }), "control character in the log: " + line);
+        if (line.starts_with("  ffmpeg: ")) ++kept;
+    }
+    check(kept == 4, "kept " + std::to_string(kept) + " lines of stderr, not 4");
+    check(std::ranges::find(played.log, "  ffmpeg: noise 4999 red bell") != played.log.end(), "colour codes or the bell kept");
+}
+#endif
 } // namespace
 
 int main() {
@@ -184,6 +249,9 @@ int main() {
     fs::create_directories(root);
     sources(root);
     tones(root);
+#ifndef _WIN32
+    if (fs::exists(root / "Radio" / "tone.wav")) chatty_tool(root);
+#endif
     fs::remove_all(root);
     std::cout << "server radio tests passed\n";
 }

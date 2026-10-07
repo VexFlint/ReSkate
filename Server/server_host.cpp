@@ -829,13 +829,11 @@ void Host::tick(std::uint64_t now) {
         log_("Everyone has loaded " + map_name() + ".");
     }
     sync_objects();
-    // The radio: its notices go to chat, its frames to everyone in the world, unreliable and
-    // fresh like voice (a late frame is worth nothing).
+    // The radio: its notices go to chat (its log lines, with why a song failed, to the log only),
+    // its frames to everyone in the world, unreliable and fresh like voice (a late frame is worth nothing).
     auto radio = radio_.poll(now_);
-    for (const auto &notice : radio.notices) {
-        log_("[radio] " + notice);
-        send_chat(notice);
-    }
+    for (const auto &line : radio.log) log_("[radio] " + line);
+    for (const auto &notice : radio.notices) send_chat(notice);
     for (const auto &batch : radio.batches) {
         auto p = packet(PacketKind::radio, now_);
         p.radio = encode_radio_batch(batch);

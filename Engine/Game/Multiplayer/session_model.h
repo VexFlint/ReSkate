@@ -206,6 +206,9 @@ struct MultiplayerModel {
     // Local: the tag the ReSkate backend gives this player ("Dev", "Staff", "Content Creator", "Centrix" or "Homie"; empty
     // for most players) and its role colour, and whether they show it, and the animated items
     // that come with it, to everyone.
+    // The local player is on the ReSkate team's developer, staff or homie list: the player list
+    // gives each player's Steam ID.
+    bool steam_ids_shown{};
     std::string identity_tag;
     std::uint32_t identity_tag_colour{};
     bool identity_tag_shown{true}, identity_items_shown{true};
@@ -254,6 +257,8 @@ struct MultiplayerModel {
     std::uint64_t local_id{}, peer_id{}, sent{}, received{}, dropped{}, pose_updates{}, board_pose_updates{};
     std::size_t skater_bones{}, board_bones{};
     std::string invite, map;
+    // The code of the session this player is in, as host or guest (`invite` is a host's own).
+    std::string join_code;
     std::string status = "Multiplayer is off.";
     std::string native_status;
     std::string cosmetic_status;

@@ -26,7 +26,7 @@ constexpr std::uint32_t content = 0x716496c8, items = 0x61742cb4,
     our_key = 0x52534d50;
 constexpr std::size_t max_actions = 1024;
 enum class Section { browser, host, join, session, voice };
-// Most sections on any owned page: Multiplayer and Custom Stuff both have five.
+// Most sections on any owned page: Multiplayer and Mod Options both have five.
 constexpr unsigned section_count = 5;
 static_assert(native_tools::sections.size() <= section_count);
 constexpr float main_width = 1800.f, side_width = 1080.f;
@@ -80,8 +80,6 @@ struct State {
     // press before the model catches up builds on the first.
     std::optional<VoiceSettings> voice_pending;
     std::uint64_t voice_pending_until{};
-    std::optional<RadioSettings> radio_pending; // the same, for the server radio
-    std::uint64_t radio_pending_until{};
     bool public_lobby{true}, was_active{}, host_seeded{};
     bool browsing{};  // the lobby browser was on screen at the last render
     std::uint64_t next_id = 1, next_scan{}, next_retry{}, next_update{}, next_render{}, owner{}, feedback_until{};

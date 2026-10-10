@@ -201,6 +201,7 @@ HRESULT STDMETHODCALLTYPE create(IDXGIFactory* factory, IUnknown* device,
     if (SUCCEEDED(result) && output && *output && device) {
         ComPtr<ID3D12CommandQueue> queue;
         if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&queue)))) DingoSDKOverlayBindDx12(*output, queue.Get());
+        else log_swapchain("DX12 swapchain ignored by the overlay: not created on a command queue", *output);
     }
     return result;
 }
@@ -219,6 +220,7 @@ HRESULT STDMETHODCALLTYPE create_hwnd(IDXGIFactory2* factory, IUnknown* device, 
     if (SUCCEEDED(result) && output && *output && device) {
         ComPtr<ID3D12CommandQueue> queue;
         if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&queue)))) DingoSDKOverlayBindDx12(*output, queue.Get());
+        else log_swapchain("DX12 swapchain ignored by the overlay: not created on a command queue", *output);
     }
     return result;
 }
@@ -259,7 +261,11 @@ bool install_factory_hook_locked() {
         const HMODULE module = GetModuleHandleW(provider);
         if (!module) continue;
         const auto address = reinterpret_cast<void*>(GetProcAddress(module, "CreateDXGIFactory1"));
-        if (address && install(s.factory, address, reinterpret_cast<void*>(factory))) return true;
+        if (address && install(s.factory, address, reinterpret_cast<void*>(factory))) {
+            dingosdk::logging::printf(dingosdk::logging::Level::info, dingosdk::logging::Channel::graphics,
+                "DXGI factories hooked in %ls.", provider);
+            return true;
+        }
     }
     return false;
 }
@@ -371,21 +377,28 @@ extern "C" bool DingoSDKOverlayStartV3(const dingosdk::overlay::CallbacksV3* cal
 }
 
 extern "C" bool DingoSDKOverlayBindDx12(IDXGISwapChain* chain, ID3D12CommandQueue* queue) {
-    if (!chain || !queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return false;
+    // A chain turned away here never gets the overlay: say why, so a game that presents on it
+    // (the log shows no "Selected presenting DX12 swapchain") can be told apart.
+    const auto ignored = [chain](const char* reason) {
+        log_swapchain((std::string("DX12 swapchain ignored by the overlay: ") + reason).c_str(), chain);
+        return false;
+    };
+    if (!chain) return false;
+    if (!queue || queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT) return ignored("not a direct command queue");
     auto& s = state();
     std::lock_guard render_lock(s.render_mutex);
     std::lock_guard hook_lock(s.hook_mutex);
     if (!s.started || s.stop.load()) return false;
     DXGI_SWAP_CHAIN_DESC description{};
-    if (FAILED(chain->GetDesc(&description)) || !description.OutputWindow
-        || description.BufferCount < 2 || description.BufferCount > 8) return false;
+    if (FAILED(chain->GetDesc(&description)) || !description.OutputWindow) return ignored("no description or window");
+    if (description.BufferCount < 2 || description.BufferCount > 8) return ignored("buffer count outside 2-8");
     DWORD process = 0;
     GetWindowThreadProcessId(description.OutputWindow, &process);
-    if (process != GetCurrentProcessId()) return false;
+    if (process != GetCurrentProcessId()) return ignored("its window is another process's");
     ComPtr<IDXGISwapChain3> extended;
-    if (FAILED(chain->QueryInterface(IID_PPV_ARGS(&extended)))) return false;
+    if (FAILED(chain->QueryInterface(IID_PPV_ARGS(&extended)))) return ignored("no IDXGISwapChain3");
     const auto identity = object_identity(chain);
-    if (!identity) return false;
+    if (!identity) return ignored("no identity");
     auto** base = *reinterpret_cast<void***>(chain);
     auto** table = *reinterpret_cast<void***>(extended.Get());
     // COM method indices are the Windows SDK's IDXGISwapChain[1/3] ABI.
@@ -395,7 +408,7 @@ extern "C" bool DingoSDKOverlayBindDx12(IDXGISwapChain* chain, ID3D12CommandQueu
         || !install(s.present1, table[22], reinterpret_cast<void*>(present1))
         || !install(s.resize1, table[39], reinterpret_cast<void*>(resize1))) {
         dingosdk::logging::write(dingosdk::logging::Level::warning, dingosdk::logging::Channel::graphics, "Swapchain hook setup incomplete; candidate ignored.");
-        return false;
+        return ignored("its methods are not the hooked ones");
     }
 
     if (auto* existing = find_binding(identity.Get())) {
@@ -411,7 +424,7 @@ extern "C" bool DingoSDKOverlayBindDx12(IDXGISwapChain* chain, ID3D12CommandQueu
         s.bindings.erase(evict);
     }
     s.bindings.push_back({identity.Get(), queue, description.OutputWindow});
-    dingosdk::logging::write(dingosdk::logging::Level::info, dingosdk::logging::Channel::graphics, "Registered DX12 swapchain and its creation queue.");
+    log_swapchain("Registered DX12 swapchain and its creation queue", chain);
     return true;
 }
 

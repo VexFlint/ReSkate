@@ -100,6 +100,43 @@ Binding* find_binding(IUnknown* identity) {
     return found == bindings.end() ? nullptr : &*found;
 }
 
+// The file name of the module `address` is in ("?" when none).
+std::wstring module_name(const void* address) {
+    HMODULE module = nullptr;
+    wchar_t path[MAX_PATH]{};
+    if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCWSTR>(address), &module) ||
+        !GetModuleFileNameW(module, path, MAX_PATH)) return L"?";
+    const std::wstring_view full(path);
+    const auto slash = full.find_last_of(L"\\/");
+    return std::wstring(slash == std::wstring_view::npos ? full : full.substr(slash + 1));
+}
+
+// Where a chain's Present is tells the game's own chain from one an interposer made
+// (Streamline, an upscaler's frame generation, a capture tool).
+void log_swapchain(const char* what, IDXGISwapChain* chain) {
+    DXGI_SWAP_CHAIN_DESC description{};
+    const bool described = chain && SUCCEEDED(chain->GetDesc(&description));
+    const auto present = chain ? module_name((*reinterpret_cast<void***>(chain))[8]) : std::wstring(L"?");
+    dingosdk::logging::printf(dingosdk::logging::Level::info, dingosdk::logging::Channel::graphics,
+        "%s: chain=%p window=%p %ux%u, %u buffers, format %u, flags 0x%x; Present in %ls.", what, chain,
+        described ? description.OutputWindow : nullptr, description.BufferDesc.Width, description.BufferDesc.Height,
+        description.BufferCount, static_cast<unsigned>(description.BufferDesc.Format), description.Flags, present.c_str());
+}
+
+// Each chain's first frame, for the first few chains. "Registered" with no "Selected presenting"
+// after it then says whether frames come from a chain the overlay never saw created, or none come.
+void log_first_present(IDXGISwapChain* presented) {
+    auto& s = state();
+    const auto identity = object_identity(presented);
+    if (!identity || s.logged_presenters.size() >= 8 ||
+        std::find(s.logged_presenters.begin(), s.logged_presenters.end(), identity.Get()) != s.logged_presenters.end())
+        return;
+    s.logged_presenters.push_back(identity.Get());
+    log_swapchain(find_binding(identity.Get()) ? "First frame from a registered DX12 swapchain"
+                                               : "First frame from a DX12 swapchain the overlay did not see created", presented);
+}
+
 bool select_presented_swapchain(IDXGISwapChain* presented) {
     auto& s = state();
     const auto identity = object_identity(presented);
@@ -459,6 +496,7 @@ void render(IDXGISwapChain* presented, UINT flags) {
         }
         return;
     }
+    log_first_present(presented);
     if (!select_presented_swapchain(presented)) return;
     if (s.failed.load()) return;
     if (!s.ready) {

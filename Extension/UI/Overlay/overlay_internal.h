@@ -148,6 +148,7 @@ struct State {
     Hook factory, create, create_hwnd, present, present1, resize, resize1, fullscreen;
     Hook clip_cursor, set_cursor_pos;
     std::vector<Binding> bindings;
+    std::vector<IUnknown*> logged_presenters; // chains whose first frame is logged (log_first_present)
     IUnknown* swapchain_identity = nullptr;
     HWND swapchain_window = nullptr;
     std::atomic<bool> selected_window_destroyed{false};
@@ -251,6 +252,8 @@ bool completed(UINT64 value, DWORD timeout_ms);
 void destroy_graphics();
 ComPtr<IUnknown> object_identity(IUnknown* object);
 Binding* find_binding(IUnknown* identity);
+// One graphics log line about a chain: its window, size and the module its Present is in.
+void log_swapchain(const char* what, IDXGISwapChain* chain);
 void guarded_render(IDXGISwapChain* chain, UINT flags) noexcept;
 
 // The command console (overlay_console.cpp).

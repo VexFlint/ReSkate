@@ -98,6 +98,13 @@ public:
     // an item anyone has.
     [[nodiscard]] std::string original(const std::vector<std::uint64_t>& points) const;
     static constexpr std::size_t shared_least = 300;
+    // For a report: the store costume most of these points are only in, and how many are, whether
+    // or not that is enough to call the mesh taken from it (empty key: none are any costume's).
+    struct Closest {
+        std::string key;
+        std::size_t shared{}, costume_points{};
+    };
+    [[nodiscard]] Closest closest(const std::vector<std::uint64_t>& points) const;
 
 private:
     static constexpr std::uint32_t nobody = 0xffffffffU;
@@ -119,8 +126,19 @@ struct StoreCopies {
         std::string mod;
         std::size_t count{};
         std::string example, original;  // one of its copies and what that copies, as written
+        // How that one was found: its mesh has the costume's geometry, or its item is fitted on
+        // what the costume is (its shape, or a store item's looks or data).
+        bool by_mesh{};
     };
     std::vector<Source> mods;
+    // Every mesh level a mod ships and how much of a store costume's geometry is in it, for a
+    // report of the check (the Paid Cosmetics Detector, the test tool): a copy or not.
+    struct MeshSeen {
+        std::string mod, mesh;
+        std::size_t points{};
+        StoreMeshes::Closest closest;
+    };
+    std::vector<MeshSeen> meshes_seen;
     // How many of the game's own items the mods' were held against; none when no mod adds an item.
     std::size_t game_items{};
     // And how many of the mods' meshes against how many of the game's costumes.
@@ -134,7 +152,11 @@ using StoreItem = std::function<bool(const std::string&)>;
 // and holds them against the game's own. The game's are only read when a mod
 // has an item at all. Never throws: a bundle that cannot be read is left out
 // (the merge leaves its mod out of the game too) and noted in `notes`.
+// The game's own files are read on up to `threads` threads beside the caller's
+// (`background`: at a priority under the game's, for a merge while it runs); the verdicts do
+// not depend on the count.
 [[nodiscard]] StoreCopies check_store_copies(const Catalog& catalog, const StoreItem& sold,
-                                             std::vector<std::string>* notes = nullptr) noexcept;
+                                             std::vector<std::string>* notes = nullptr, std::size_t threads = 0,
+                                             bool background = false) noexcept;
 
 } // namespace dingosdk::mods

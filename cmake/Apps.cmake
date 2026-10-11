@@ -241,7 +241,7 @@ else()
         target_include_directories(dingosdk_server_gui PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_include_directories(dingosdk_server_gui SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/External/steam_networking")
         target_link_libraries(dingosdk_server_gui PRIVATE dingosdk_launcher_support dingosdk_world_layer_scan dingosdk_json
-            dingosdk_lz4 dingosdk_zstd dingosdk_miniz dingosdk_word_filter OpenSSL::Crypto dingosdk_imgui_gl dl pthread)
+            dingosdk_lz4 dingosdk_zstd dingosdk_miniz dingosdk_word_filter OpenSSL::Crypto dingosdk_opus dingosdk_imgui_gl dl pthread)
         set_target_properties(dingosdk_server_gui PROPERTIES OUTPUT_NAME "ReSkateServerGUI")
     endif()
 endif()

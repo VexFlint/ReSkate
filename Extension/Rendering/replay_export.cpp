@@ -1,10 +1,14 @@
 #include "replay_export.h"
 #include "Engine/Core/Hooks/hooks.h"
+#include "Engine/Core/Log/logging.h"
 #include "Engine/Core/Platform/memory.h"
 #include "Engine/Game/Build/addresses.h"
 #include "Engine/Game/Build/20260929/replay_export.h"
+#include "Engine/Game/Build/supported_build.h"
 #include <array>
 #include <atomic>
+#include <cstring>
+#include <Windows.h>
 
 namespace dingosdk::replay_export {
 namespace {
@@ -29,8 +33,11 @@ bool start(std::uintptr_t base) noexcept {
     try {
         std::array<unsigned char, native::submit_frame_prefix.size()> bytes{};
         if (!base || !memory::read_bytes(base + native::submit_frame, bytes.data(), bytes.size()) ||
-            bytes != native::submit_frame_prefix)
+            bytes != native::submit_frame_prefix) {
+            logging::write(logging::Level::warning, logging::Channel::graphics,
+                "Replay export frame pacing hook skipped: game code did not match the supported build.");
             return false;
+        }
         image = base;
         auto* target = reinterpret_cast<void*>(base + native::submit_frame);
         void* previous{};

@@ -16,6 +16,7 @@
 #include "Engine/Core/Console/console_entry.h"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -77,6 +78,30 @@ enum class DebugAction {
     set_first_person_camera_cycle,
     reset_first_person_arm,
     set_free_camera_fov,  // 0 = the game's own FOV
+    set_drone_follow,     // the drone flies itself behind the skater, and the view is its camera
+    set_revert_boost_enabled,
+    set_revert_boost_speed,
+    set_probe_enabled,
+    set_dark_pop_enabled,
+    set_dark_pop_unpatch,
+    set_dark_pop_hold,
+    set_dark_pop_one_press,
+    set_dark_pop_route_stay,
+    set_dark_pop_route_guard,
+    set_dark_pop_keep_speed,
+    set_dark_pop_catch,
+    set_dark_pop_feet,
+    set_dark_pop_adaptive,
+    set_dark_pop_timeout,
+    set_dark_pop_strength,
+    set_dark_pop_hold_landing,
+    set_dark_pop_dark_exit,
+    set_dark_pop_full_flight,
+    set_dark_pop_hold_flight,
+    set_dark_pop_stay_physical,
+    set_dark_pop_early_physics,
+    set_dark_pop_reaim,
+    set_dark_pop_hide_dpad,
     // Keep the last action in sync with the bound in request_scheduler.h.
 };
 
@@ -93,12 +118,23 @@ struct FlightInput {
     float look_x = 0, look_y = 0;
 };
 
+// May change what the GAME reads from an XInput pad (never what ReSkate itself reads). `user` is
+// the XInput slot. Called on whatever thread the game polls from, once per poll that returns a
+// pad. The grind exit control's grab and lean guards (grind_exit_control.h).
+struct GamepadValues {
+    std::uint16_t buttons = 0;
+    std::uint8_t left_trigger = 0, right_trigger = 0;
+    std::int16_t left_x = 0, left_y = 0, right_x = 0, right_y = 0;
+};
+using GamepadFilter = void (*)(unsigned user, GamepadValues& pad) noexcept;
+
 struct DebugModel {
     bool available = false;
     bool camera_available = false;
     bool ui_available = false;
     bool free_camera = false;
     bool first_person = false;
+    bool drone_follow = false;  // the drone flies itself behind the skater (Skater/drone_follow.h)
     // Vertical degrees applied to the first-person view; 0 keeps the camera's own.
     float first_person_fov = 0;
     float free_camera_fov = 0;  // 0 = the game's own FOV
@@ -125,9 +161,37 @@ struct DebugModel {
     bool settings_owned = false;
     // ReSkate free-flight speed in world units per second.
     float camera_speed = 15.0f;
-    float forward_velocity_speed = 20.0f;
-    float up_velocity_speed = 20.0f;
-    float offboard_up_velocity_speed = 20.0f;
+    // Boost speeds; 0 is off (the stock setting).
+    float forward_velocity_speed = 0.0f;
+    float up_velocity_speed = 0.0f;
+    float offboard_up_velocity_speed = 0.0f;
+    // Revert Boost: a forward speed added when the game auto reverts a landing.
+    bool revert_boost = false;
+    float revert_boost_speed = 1.0f; // strength multiplier
+    std::uint64_t revert_boost_count = 0;
+    // Dark Pop: the pre-0.32.0 dark pop (see no_bail.cpp). The rest are its advanced settings.
+    bool dark_pop = false;
+    bool dark_pop_unpatch = true;   // placement entered the pre-0.32.0 way at the dark landing
+    bool dark_pop_hold = true;      // the old hold (foot-attach mode 2) in the landing window
+    bool dark_pop_one_press = true; // the D-pad must be let go before the next arming
+    float dark_pop_route_stay = 0.0f;   // ticks of 601 before the stay bit is cancelled (the sink length; 1.9: 0, the 1.0 setting, by default)
+    float dark_pop_route_guard = 12.0f; // pop ticks guarded after a 601 exit
+    bool dark_pop_keep_speed = true;    // the landing's horizontal speed put back at the 601 exit
+    bool dark_pop_catch = true;         // 1.0: a dismount straight from the air on an armed dark flight is routed too
+    bool dark_pop_feet = false;         // 1.7: feet-only hold (1.9: off by default) (the plant's own foot attaches cleared in the sink, a two-tick one requested)
+    bool dark_pop_adaptive = true;      // 1.7: the sink ends the tick the board starts rolling over
+    bool dark_pop_timeout = true;       // 1.9: a landing 201 timed out on (board dark, resting) is routed to the sink too
+    float dark_pop_strength = 8.0f;     // 2.4: the launch (m/s) the bodies' vertical velocity is lifted to on the pop's second and third ticks; 0 = off
+    bool dark_pop_hold_landing = true;  // 2.0: +0x13cc bit 20 raised around the chooser so a timed-out landing can be staged by the game
+    bool dark_pop_dark_exit = true;     // 2.1: the board put back as it landed on the sink's exit tick
+    bool dark_pop_full_flight = true;   // 2.1: the landing countdown floored at the ballistic time on a pop's flight
+    bool dark_pop_hold_flight = true;   // 2.3: contact landings blocked on a pop's flight while the countdown runs
+    float dark_pop_stay_physical = 6.0f; // 2.5: ticks after the exit the pop stays in the physics air state (the jump-fired bit hidden); 0 = off
+    bool dark_pop_early_physics = true;  // 2.6: a pop whose jump fired on its first ticks (180 landings) stays physical for the whole flight
+    bool dark_pop_reaim = true;
+    bool dark_pop_hide_dpad = true;      // 3.1: in the air the game's polls see the D-pad let go (no Quick Drop radial)          // 2.7: instead, after Stay physical ticks the animation's flight curve is re-aimed from where the body is and handed over
+    std::uint64_t dark_pop_count = 0;
+    bool probe = false; // Dark pop probe: writes logs\dark-pop-probe.csv
     bool camera_position_valid = false;
     bool skater_position_valid = false;
     std::array<float, 3> camera_position{};
@@ -211,17 +275,44 @@ struct HallOfMeatModel {
 };
 
 // Road Rash's switches (Extension/RoadRash/road_rash.h): started, switched on, and whether its
-// worst wounds bleed.
+// worst wounds bleed. `off`: its official mod is turned off in the launcher, and no menu lists it.
 struct RoadRashModel {
     bool available = false, enabled = false, blood = false;
+    bool off = false;
 };
 
 // Board Break's switch (Extension/BoardBreak/board_break.h): started, switched on, and which of
-// its decks is the one in the game (none: no deck pack loads, and no board can break).
+// its decks is the one in the game (none: no deck pack loads, and no board can break). `off`: its
+// official mod is turned off in the launcher, and no menu lists it.
 struct BoardBreakModel {
     bool available = false, enabled = false, has_deck = false;
     std::string deck = "None";
+    bool off = false;
+    // Its settings (Extension/BoardBreak/board_break_feel.h) and how worn the board is (0 to 1, and
+    // its word).
+    bool always = false, rails = true, wear = true, crack_sounds = true, body_sounds = true;
+    int sensitivity = 100, joined = 50, wear_rate = 100;
+    float worn = 0;
+    std::string condition = "new";
 };
+
+// Grind exit control's switches (Extension/Skater/grind_exit_control.h): started, switched on,
+// LT/RT toe/heel (else left/right of travel), and the player's stance (0 not set, 1 regular,
+// 2 goofy).
+struct GrindExitModel {
+    bool available = false, enabled = false, toe_heel = true;
+    int stance = 0;
+    int strength = 100; // pop-out strength, percent (10-100)
+};
+
+// Keyframe smoothing (Extension/ReplayKeyframes/replay_keyframes.h): started, switched on, and how
+// smooth (0..1) when on.
+struct KeyframeSmoothingModel {
+    bool available = false, enabled = false;
+    float amount = 1.0f;
+};
+// The smoothness as the menus show it, in percent.
+inline int keyframe_smoothness_percent(const KeyframeSmoothingModel& k) { return static_cast<int>(k.amount * 100.0f + 0.5f); }
 
 struct Model {
     std::string state = "Waiting for native state";
@@ -244,9 +335,14 @@ struct Model {
     HallOfMeatModel hall_of_meat;
     RoadRashModel road_rash;
     BoardBreakModel board_break;
+    GrindExitModel grind_exit;
+    KeyframeSmoothingModel keyframe_smoothing;
     ObjectPersistenceModel object_persistence;
     ParkEditorModel editor;
     float menu_scale = default_menu_scale;
+    float menu_scale_fullscreen = default_menu_scale; // the full screen menu's own size (`ui scalefull`)
+    // The ReSkate menu fills the screen, made for a controller, instead of a window (`ui fullscreen`).
+    bool menu_fullscreen = false;
     // Offline mode: no Steam, so every multiplayer page and control is hidden.
     bool steam_offline = false;
     ControllerBindingsModel bindings;
@@ -320,9 +416,23 @@ struct MapVoteIcon {
     unsigned side{};
 };
 void set_map_vote_icons(const std::vector<MapVoteIcon>& icons) noexcept;
+// The menu's map grid (Map > Travel): the levels it shows ask for their pictures, which
+// Assets/map_icons.cpp finds off the game's thread (MapVoteIcon::name is then the level's asset).
+struct MenuMapWanted {
+    std::string asset, name;
+};
+std::vector<MenuMapWanted> take_menu_map_request() noexcept;
+void set_menu_map_pictures(const std::vector<MapVoteIcon>& pictures) noexcept;
 // That vote's popup (map_download_card.cpp), for the runtime, which reads the controller and
 // holds the game's input while it is up: whether it is, moving the pick, voting for the pick
 // (the popup then closes), and closing it without a vote. Any thread.
+// A message the player has to see and say OK to, in the middle of the screen (message_card.cpp):
+// that they were kicked or banned from a server, and why. One at a time: a new one takes the
+// place of one still up. For the runtime, which reads the controller and holds the game's input
+// while it is up, as for the vote below: whether it is, and closing it. Any thread.
+void show_message(std::string title, std::string text) noexcept;
+bool message_asking() noexcept;
+void message_dismiss() noexcept;
 bool map_vote_asking() noexcept;
 void map_vote_move(int by) noexcept;
 void map_vote_take() noexcept;
@@ -386,14 +496,16 @@ void set_skate_hud_feed(SkateHudFeed) noexcept;
 struct NametagBubble {
     std::string text, raw;
     float appear{1}, fade{1};
+    bool hint{}; // grey typing discs, not a chat line. text is ".", "..", or "..." for 1, 2, or 3 discs
 };
 struct Nametag {
     std::array<float, 3> position{}; // above the skater's head, world space
     std::string name;
     std::uint32_t color{0xffffffffU}; // R, G, B, A bytes (IM_COL32)
-    std::string tag;                  // role badge before the name ("Dev", "Staff", "Content Creator", "Centrix", "Homie", "Admin", "Host", "Friend")
+    std::string tag;                  // role badge before the name ("Dev", "ReSkate Admin", "Content Creator", "Centrix", "Homie", "Admin", "Host", "Friend")
     float distance{};                 // metres from the local skater
     bool talking{};
+    bool flying_drone{};              // flying the FPV drone: a FLYING DRONE label above the name
     // Recent chat lines to show as bubbles above the head, oldest first ("" = none).
     std::vector<NametagBubble> bubbles;
     bool self{};                      // the local player: bubbles only, never a name or dot
@@ -419,6 +531,11 @@ struct ItemBrowserView {
     std::string search, filter; // the search text and the filter's name
     unsigned shown{}, total{};  // tiles in the grid that has the focus
     bool focused_favorite{};    // the highlighted item is a favorite
+    // The mod the highlighted item is from (empty title: the game's own), for its card: its icon
+    // file (UTF-8), how many items it has, and whether it only changes one of the game's.
+    std::string mod_title, mod_author, mod_version, mod_icon;
+    unsigned mod_items{};
+    bool mod_changed{};
 };
 struct ItemBrowserHost {
     ItemBrowserView (*view)(){};
@@ -436,6 +553,10 @@ using ParkSelectionQueue = bool (*)(const EditorSelectionRequest &);
 void set_park_selection_queue(ParkSelectionQueue) noexcept;
 using ParkPasteQueue = bool (*)(const EditorPasteRequest &);
 void set_park_paste_queue(ParkPasteQueue) noexcept;
+using ParkObjectSetQueue = bool (*)(const EditorObjectSetRequest &);
+void set_park_object_set_queue(ParkObjectSetQueue) noexcept;
+using ParkDeleteQueue = bool (*)(const EditorDeleteRequest &);
+void set_park_delete_queue(ParkDeleteQueue) noexcept;
 struct CallbacksV3 {
     void* user = nullptr;
     void (*read_model)(void* user, Model& output) = nullptr;
@@ -454,6 +575,9 @@ struct CallbacksV3 {
 // moving the focus, 7 pressing something, 56 changing tab). Any thread.
 using UiSound = void (*)(std::uint32_t sound) noexcept;
 void set_ui_sound(UiSound) noexcept;
+// One of the game's menu sounds, by its number (UI/NativeMenu/ui_sound.h): 3 moving the focus,
+// 7 pressing, 56 changing tab, as the pause menu's own pages make them.
+void play_ui_sound(std::uint32_t sound) noexcept;
 // What those pages read the game with and act through: callbacks as the overlay's own, with a
 // read_model that takes a snapshot and leaves the console log alone (it is asked a few times a
 // second while a page is drawn).
@@ -488,6 +612,47 @@ extern "C" __declspec(dllexport) bool DingoSDKOverlayStartV2(
 extern "C" __declspec(dllexport) bool DingoSDKOverlayStartV3(
     const dingosdk::overlay::CallbacksV3* callbacks);
 
+namespace dingosdk::overlay {
+// The first Xbox (XInput) or PlayStation (DualShock 4 / DualSense) controller, read directly.
+// Sticks are -1..1 (up and right positive), triggers 0..1; `buttons` is XInput's wButtons bit mask.
+// Used by the FPV drone's controller selection (Skater/drone_radio.h); safe from any thread.
+struct Gamepad {
+    bool valid = false;
+    bool playstation = false;
+    float left_x = 0, left_y = 0, right_x = 0, right_y = 0;
+    float left_trigger = 0, right_trigger = 0;
+    unsigned buttons = 0;
+};
+Gamepad read_gamepad();
+// The full screen menu's page draws its own controls with their own focus (ONLINE: the pause
+// menu's pages): the controller then drives that, not ImGui's navigation.
+inline std::atomic<bool>& menu_page_owns_pad() {
+    static std::atomic<bool> value{false};
+    return value;
+}
+// The controller is in charge of the full screen menu: the pointer is hidden (and points at
+// nothing) until the mouse moves or clicks (overlay_render.cpp sets it, cursor.cpp clears it).
+inline std::atomic<bool>& menu_pad_in_charge() {
+    static std::atomic<bool> value{false};
+    return value;
+}
+// The menu was last drawn full screen (its controller pace, overlay_render.cpp).
+inline std::atomic<bool>& menu_fullscreen_shown() {
+    static std::atomic<bool> value{false};
+    return value;
+}
+// `menu` (and the controller bind for it) asks for the ReSkate menu to open; the overlay takes it.
+inline std::atomic<bool>& menu_open_flag() {
+    static std::atomic<bool> value{false};
+    return value;
+}
+// Reads of a controller between these two calls see the real device even while ReSkate keeps
+// the game from reading it (freecam or drone controller capture). Same thread, paired.
+// The FPV drone reads its controller this way (Skater/drone_radio.h).
+void begin_input_access() noexcept;
+void end_input_access() noexcept;
+}
+
 // Nonblocking. A later Present releases GPU resources after its fence completes.
 // The DLL stays pinned until process exit so no thread can return into unloaded
 // detours. Input is released immediately, even if rendering has stopped.
@@ -506,6 +671,8 @@ extern "C" unsigned DingoSDKOverlayReadPromptKeys();
 // allow_menu is used only by the Binds page while recording. Focus and lifetime
 // gates still apply. Gameplay callers leave it false.
 extern "C" void DingoSDKOverlayReadControllerInput(dingosdk::ControllerInput* input, bool allow_menu = false);
+// Installs (or, with nullptr, removes) the one gamepad filter. Any thread.
+extern "C" void DingoSDKOverlaySetGamepadFilter(dingosdk::overlay::GamepadFilter filter);
 
 // Optional direct integration for a host that already knows its exact pair.
 struct IDXGISwapChain;

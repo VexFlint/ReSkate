@@ -1,0 +1,26 @@
+name: linux-gui-check
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+jobs:
+  arch-gui:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm base-devel cmake openssl sdl3 git
+      - uses: actions/checkout@v4
+      - run: cmake --preset linux-x64 -DDINGOSDK_BUILD_MULTIPLAYER_TESTS=ON
+      - run: cmake --build --preset linux-release -j"$(nproc)" 2>&1 | tee build.log
+      - run: grep -E "warning|error" build.log | grep -v "^--" || true
+      - run: test -x build/linux/ReSkateServer && test -x build/linux/ReSkateServerGUI
+      - run: ctest --test-dir build/linux --output-on-failure -j"$(nproc)"
+  ubuntu-headless:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y build-essential cmake libssl-dev
+      - uses: actions/checkout@v4
+      - run: cmake --preset linux-x64
+      - run: cmake --build --preset linux-release -j"$(nproc)" 2>&1 | tee build.log
+      - run: grep -E "warning|error" build.log | grep -v "^--" || true
+      - run: test -x build/linux/ReSkateServer && test ! -e build/linux/ReSkateServerGUI
